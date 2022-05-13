@@ -1,30 +1,22 @@
-use std::cmp::min;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufReader, BufWriter, Read};
 use std::os::unix::process::CommandExt;
-use std::process::{Command, exit};
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+use std::thread::spawn;
 
 use anyhow::Result;
-use eframe::{egui, epi};
-use egui::{Color32, Event, Key, Label, Widget};
+use eframe::{App, AppCreator, CreationContext, egui, Storage};
+use eframe::egui::{Color32, Event, Key, Label, Widget};
 use fuzzy_matcher::FuzzyMatcher;
 use itertools::Itertools;
+use serde::Deserialize;
+use serde::Serialize;
 
-#[derive(Clone, Eq, PartialEq)]
-struct Item {
-    label: String,
-    value: String,
+use crate::egui::{Context, Frame, RichText, Spinner, Visuals};
+use crate::shuttle::{Github, Item, Jenkins, Matcher, Provider};
 
-    // the field that should be used for searching.
-    haystack: String,
-}
-
-trait Matcher {
-    /// Applies the query against the list of items and returns a list of matching items.
-    /// The resulting list should be ordered by match score
-    /// with the best match in the first place.
-    fn matches<'a>(&self, query: &str, items: &'a [Item]) -> Vec<&'a Item>;
-}
+mod shuttle;
 
 impl<T> Matcher for T where T: FuzzyMatcher {
     fn matches<'a>(&self, query: &str, items: &'a [Item]) -> Vec<&'a Item> {
@@ -41,72 +33,79 @@ impl<T> Matcher for T where T: FuzzyMatcher {
     }
 }
 
+struct SimpleMatcher;
 
-impl Item {
-    pub fn parse(value: impl Into<String>) -> Result<Item> {
-        let value = value.into();
+impl Matcher for SimpleMatcher {
+    fn matches<'a>(&self, query: &str, items: &'a [Item]) -> Vec<&'a Item> {
+        let query = query.to_lowercase();
+        let query_parts = query.split_whitespace().collect_vec();
 
-        let label_base = value.trim_end_matches('/');
-
-        let label = match label_base.rfind('/') {
-            Some(idx) => label_base[idx + 1..].to_string(),
-            None => value.clone(),
-        };
-
-        let haystack = value.to_string()
-            .replace('_', " ")
-            .replace('/', " ")
-            .to_lowercase();
-
-        Ok(Item { value, label, haystack })
+        items.iter()
+            .filter(|item| query_parts
+                .iter()
+                .all(|part| item.haystack.contains(part)))
+            .collect()
     }
 }
 
-struct ShuttleApp {
-    query: String,
+enum ShuttleState {
+    Loading,
+    Loaded(LoadedState),
+}
 
+struct LoadedState {
     all: Vec<Item>,
-    filtered: Vec<Item>,
+    filtered: Option<Vec<Item>>,
     selected: usize,
-
-    matcher: Box<dyn Matcher>,
 }
 
-impl ShuttleApp {
-    pub fn new(matcher: Box<dyn Matcher>, items: Vec<Item>) -> Self {
-        Self {
-            query: String::new(),
-            all: items.clone(),
-            filtered: items,
-            selected: 0,
-            matcher,
+impl LoadedState {
+    fn update_filtered_reset(&mut self, matcher: &dyn Matcher, query: &str) {
+        self.filtered = None;
+
+        if query.is_empty() {
+            self.filtered = Some(self.all.clone())
+        } else {
+            self.update_filtered(matcher, query);
         }
     }
 
-    fn update_filtered_reset(&mut self) {
-        self.filtered = self.all.clone();
+    fn update_filtered(&mut self, matcher: &dyn Matcher, query: &str) {
+        let query = query.to_lowercase();
 
-        if !self.query.is_empty() {
-            self.update_filtered();
-        }
-    }
+        let selected_value = self.filtered
+            .as_ref()
+            .and_then(|values| values.get(self.selected));
 
-    fn update_filtered(&mut self) {
-        let query = self.query.to_lowercase();
+        let values_to_filter = self.filtered.as_ref().unwrap_or(&self.all);
 
-        let selected_value = self.filtered.get(self.selected);
-
-        let filtered_new = self.matcher
-            .matches(query.as_str(), &self.filtered)
+        let filtered_new = matcher
+            .matches(query.as_str(), values_to_filter)
             .into_iter()
             .cloned()
             .collect_vec();
 
         self.selected = selected_value
-            .and_then(|val| self.filtered.iter().position(|item| item == val))
+            .and_then(|val| self.filtered.iter().flatten().position(|item| item.value == val.value))
             .unwrap_or_default();
 
-        self.filtered = filtered_new;
+        self.filtered = Some(filtered_new);
+    }
+}
+
+struct ShuttleApp {
+    query: String,
+    state: Arc<Mutex<ShuttleState>>,
+    matcher: Box<dyn Matcher>,
+}
+
+impl ShuttleApp {
+    pub fn new(matcher: Box<dyn Matcher>) -> Self {
+        Self {
+            query: String::new(),
+            state: Arc::new(ShuttleState::Loading.into()),
+            matcher,
+        }
     }
 
     pub fn launch(&self, url: &str) {
@@ -114,62 +113,96 @@ impl ShuttleApp {
             .arg(url)
             .exec();
     }
-}
 
-impl epi::App for ShuttleApp {
-    fn update(&mut self, ctx: &egui::CtxRef, _frame: &mut epi::Frame<'_>) {
+    fn handle_events(&mut self, ctx: &&Context, frame: &mut eframe::Frame) {
+        let state = &mut *self.state.lock().unwrap();
+
+        let mut require_update = false;
+        let mut require_reset = false;
+
+        let mut move_steps: i32 = 0;
+        let mut launch = false;
+
+
         for event in &ctx.input().events {
             match event {
                 Event::Text(t) => {
                     self.query += t;
-                    self.update_filtered();
+                    require_update = true;
                 }
 
                 Event::Key { key: Key::Backspace, pressed: true, .. } => {
                     if let Some((pos, _)) = self.query.char_indices().last() {
                         self.query.remove(pos);
-                        self.update_filtered_reset();
+                        require_reset = true;
                     }
                 }
 
                 Event::Key { key: Key::W, pressed: true, modifiers } if modifiers.ctrl => {
                     if let Some(pos) = self.query.trim_end().rfind(' ') {
                         self.query.truncate(pos + 1);
-                        self.update_filtered_reset();
+                        require_reset = true;
                     } else {
                         self.query.truncate(0);
-                        self.update_filtered_reset();
+                        require_reset = true;
                     }
-                }
-
-                Event::Key { key: Key::Enter, pressed: true, .. } => {
-                    if let Some(selected) = self.filtered.get(self.selected) {
-                        println!("launching {:?}", selected.value);
-                        self.launch(&selected.value);
-                    }
-                }
-
-                Event::Key { key: Key::ArrowUp, pressed: true, .. } => {
-                    self.selected = self.selected.saturating_sub(1);
-                }
-
-                Event::Key { key: Key::ArrowDown, pressed: true, .. } => {
-                    let max_value = self.filtered.len() - 1;
-                    self.selected = min(max_value, self.selected + 1);
                 }
 
                 Event::Key { key: Key::Escape, pressed: true, .. } => {
-                    exit(1);
+                    frame.quit();
+                }
+
+                Event::Key { key: Key::Enter, pressed: true, .. } => {
+                    launch = true;
+                }
+
+                Event::Key { key: Key::ArrowUp, pressed: true, .. } => {
+                    move_steps -= 1;
+                }
+
+                Event::Key { key: Key::ArrowDown, pressed: true, .. } => {
+                    move_steps += 1;
                 }
 
                 _ => ()
-            };
+            }
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            ui.set_height(480.0);
-            ui.set_width(640.0);
+        match state {
+            ShuttleState::Loading => {}
 
+            ShuttleState::Loaded(state) => {
+                if state.filtered.is_none() {
+                    require_reset = true;
+                }
+
+                if require_reset {
+                    state.update_filtered_reset(self.matcher.as_ref(), &self.query);
+                } else if require_update {
+                    state.update_filtered(self.matcher.as_ref(), &self.query);
+                }
+
+                if let Some(filtered) = state.filtered.as_ref() {
+                    if !filtered.is_empty() {
+                        state.selected = (state.selected as i32 + move_steps).rem_euclid(filtered.len() as _) as _;
+                    }
+
+                    if launch {
+                        if let Some(selected) = filtered.get(state.selected) {
+                            //println!("launching {:?}", selected.value);
+                            self.launch(&selected.value);
+                            return frame.quit();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn paint(&mut self, ctx: &Context) {
+        let state = &mut *self.state.lock().unwrap();
+
+        egui::CentralPanel::default().show(ctx, |ui| {
             // make it all monospaced
             ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
 
@@ -180,62 +213,153 @@ impl epi::App for ShuttleApp {
                 ui.horizontal(|ui| {
                     ui.set_height(32.0);
                     let query_str = String::from("> ") + &self.query;
-                    Label::new(query_str)
-                        .text_color(Color32::GOLD)
-                        .ui(ui);
+                    Label::new(RichText::new(query_str).color(Color32::GOLD)).ui(ui);
                 });
 
                 ui.separator();
 
-                let items_iter = self.filtered.iter()
-                    .enumerate()
-                    .skip(self.selected.saturating_sub(8));
+                if let ShuttleState::Loaded(state) = state {
+                    let items_iter = state.filtered.iter()
+                        .flatten()
+                        .enumerate()
+                        .skip(state.selected.saturating_sub(8));
 
-                for (idx, item) in items_iter {
-                    let selected = self.selected == idx;
-                    let color: Color32 = if selected { Color32::WHITE } else { Color32::GRAY };
+                    for (idx, item) in items_iter {
+                        let selected = state.selected == idx;
+                        let color: Color32 = if selected { Color32::WHITE } else { Color32::GRAY };
 
-                    let response = ui.horizontal(|ui| {
-                        ui.set_height(24.0);
+                        let response = ui.horizontal(|ui| {
+                            ui.set_height(24.0);
 
-                        let label = Label::new(&item.label)
-                            .text_color(color)
-                            .ui(ui);
+                            let label = Label::new(RichText::new(&item.label).color(color)).ui(ui);
 
-                        label.rect
-                    });
+                            label.rect
+                        });
 
-                    if !ui.clip_rect().intersects(response.inner) {
-                        break;
+                        if !ui.clip_rect().intersects(response.inner) {
+                            break;
+                        }
                     }
+                }
+
+                if let ShuttleState::Loading = state {
+                    ui.centered_and_justified(|ui| {
+                        ui.add(Spinner::new().size(32.0));
+                    });
                 }
             })
         });
     }
+}
 
-    fn name(&self) -> &str {
-        "Shuttle"
+impl App for ShuttleApp {
+    fn update(&mut self, ctx: &Context, frame: &mut eframe::Frame) {
+        self.handle_events(&ctx, frame);
+        self.paint(ctx);
     }
 }
 
-fn main() -> anyhow::Result<()> {
-    let mut items = BufReader::new(File::open("/tmp/urls")?).lines()
-        .flatten()
-        .filter(|line| !line.trim().is_empty())
-        .map(Item::parse)
-        .collect::<Result<Vec<_>, _>>()?;
+fn create_app(cc: &CreationContext<'_>, app: ShuttleApp) -> Box<dyn App> {
+    cc.egui_ctx.set_visuals(Visuals::dark());
 
-    items.sort_by(|lhs, rhs| lhs.haystack.cmp(&rhs.haystack));
+    // cc.frame.set_window_size(egui::Vec2::new(800.0, 600.0));
 
+    let ctx = cc.egui_ctx.clone();
+    let state_arc = Arc::clone(&app.state);
+
+    spawn(move || {
+        let items = load_items().unwrap();
+
+        let mut state = state_arc.lock().unwrap();
+
+        *state = ShuttleState::Loaded(
+            LoadedState {
+                all: items,
+                filtered: None,
+                selected: 0,
+            }
+        );
+
+        drop(state);
+
+        ctx.request_repaint();
+    });
+
+    Box::new(app)
+}
+
+fn load_items_from_providers() -> Result<Vec<Item>> {
+    let gh = "https://srv-git-01-hh1.alinghi.tipp24.net/api/v3";
+
+    let providers: Vec<Box<dyn Provider>> = vec![
+        Box::new(Github::new_with_endpoint("b2b", gh)),
+        Box::new(Github::new_with_endpoint("eSailors", gh)),
+        Box::new(Github::new_with_endpoint("iwg", gh)),
+        Box::new(Github::new_with_endpoint("tipp24", gh)),
+        Box::new(Github::new_with_endpoint("website", gh)),
+        Box::new(Github::new_with_endpoint("zig", gh)),
+        Box::new(Jenkins::new("http://jenkins.iwg.ham.sg-cloud.co.uk")),
+        Box::new(Jenkins::new("http://platform-live.code.ham.sg-cloud.co.uk")),
+        Box::new(Jenkins::new("http://platform.code.ham.sg-cloud.co.uk")),
+        Box::new(Jenkins::new("http://zig-jenkins.iwg.ham.sg-cloud.co.uk")),
+    ];
+
+    use rayon::prelude::*;
+
+    let items: Vec<_> = providers.par_iter()
+        .map(|prov| prov.load())
+        .collect();
+
+    let items = items.into_iter()
+        .flatten_ok()
+        .try_collect()
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+
+    Ok(items)
+}
+
+fn load_items_from_cache(r: impl Read) -> Result<Vec<Item>> {
+    let cache: ItemCache = serde_json::from_reader(BufReader::new(r))?;
+    Ok(cache.items)
+}
+
+fn load_items() -> Result<Vec<Item>> {
+    match File::open("/tmp/shuttle.cache") {
+        Ok(fp) => load_items_from_cache(fp),
+        Err(_) => {
+            let mut items = load_items_from_providers()?;
+
+            // by default we sort all items by display label
+            items.sort_by(|lhs, rhs| lhs.label.cmp(&rhs.label));
+
+            // serialize all items into the item cache
+            let cache = ItemCache { items: items.clone() };
+            let writer = BufWriter::new(File::create("/tmp/shuttle.cache")?);
+            serde_json::to_writer(writer, &cache)?;
+
+            Ok(items)
+        }
+    }
+}
+
+fn main() -> Result<()> {
     let native_options = eframe::NativeOptions {
         always_on_top: true,
         resizable: false,
-        transparent: true,
-        initial_window_size: Some(egui::Vec2::new(640.0, 480.0)),
+        transparent: false,
+        decorated: false,
         ..Default::default()
     };
 
-    let matcher = Box::new(fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case());
-    let app = ShuttleApp::new(matcher, items);
-    eframe::run_native(Box::new(app), native_options);
+    // let matcher = Box::new(fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case());
+    let matcher = Box::new(SimpleMatcher);
+    let app = ShuttleApp::new(matcher);
+    let app_name = "shuttle";
+    let app_creator: AppCreator = Box::new(|ctx| create_app(ctx, app));
+    eframe::run_native(app_name, native_options, app_creator)
+}
+
+#[derive(Serialize, Deserialize)]
+struct ItemCache {
+    items: Vec<Item>,
 }
