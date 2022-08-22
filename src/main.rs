@@ -337,7 +337,8 @@ fn main() -> Result<()> {
     let app = ShuttleApp::new(providers, matcher);
     let app_name = "shuttle";
     let app_creator: AppCreator = Box::new(|ctx| create_app(ctx, app));
-    eframe::run_native(app_name, native_options, app_creator)
+    eframe::run_native(app_name, native_options, app_creator);
+    Ok(())
 }
 
 #[derive(Serialize, Deserialize)]
