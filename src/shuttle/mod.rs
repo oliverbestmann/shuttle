@@ -3,14 +3,17 @@
 use serde::{Deserialize, Serialize};
 
 pub use providers::*;
+pub use matchers::*;
 
 mod providers;
+mod matchers;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Item {
     /// The label will be used to display the item in the UI.
     pub label: String,
 
+    /// The URL that will be opened on selection.
     pub value: String,
 
     /// The haystack field will be used for actual querying.

@@ -26,6 +26,10 @@ impl Github {
 }
 
 impl Provider for Github {
+    fn title(&self) -> String {
+        format!("[github] {}", self.orga)
+    }
+    
     fn load(&self) -> Result<Vec<Item>, Box<dyn Error + Send + Sync>> {
         // TODO fetch more than the first page of URLs
         let url = format!(

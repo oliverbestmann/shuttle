@@ -16,6 +16,10 @@ impl Jenkins {
 }
 
 impl Provider for Jenkins {
+    fn title(&self) -> String {
+        format!("[jenkins] {}", self.endpoint)
+    }
+
     fn load(&self) -> Result<Vec<Item>, Box<dyn Error + Send + Sync>> {
         let url = format!("{}/api/json", self.endpoint);
         let response: Response = ureq::get(&url).call()?.into_json()?;

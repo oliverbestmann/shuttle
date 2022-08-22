@@ -8,7 +8,6 @@ use std::thread::spawn;
 use anyhow::Result;
 use eframe::{App, AppCreator, CreationContext, egui, Storage};
 use eframe::egui::{Color32, Event, Key, Label, Widget};
-use fuzzy_matcher::FuzzyMatcher;
 use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
@@ -17,36 +16,6 @@ use crate::egui::{Context, Frame, RichText, Spinner, Visuals};
 use crate::shuttle::{Github, Item, Jenkins, Matcher, Provider};
 
 mod shuttle;
-
-impl<T> Matcher for T where T: FuzzyMatcher {
-    fn matches<'a>(&self, query: &str, items: &'a [Item]) -> Vec<&'a Item> {
-        items.iter()
-            .flat_map(|item| {
-                self
-                    .fuzzy_match(&item.haystack, query)
-                    .map(|score| (score, item))
-            })
-
-            .sorted_by_key(|(score, _item)| -score)
-            .map(|(_score, item)| item)
-            .collect()
-    }
-}
-
-struct SimpleMatcher;
-
-impl Matcher for SimpleMatcher {
-    fn matches<'a>(&self, query: &str, items: &'a [Item]) -> Vec<&'a Item> {
-        let query = query.to_lowercase();
-        let query_parts = query.split_whitespace().collect_vec();
-
-        items.iter()
-            .filter(|item| query_parts
-                .iter()
-                .all(|part| item.haystack.contains(part)))
-            .collect()
-    }
-}
 
 enum ShuttleState {
     Loading,
@@ -97,13 +66,15 @@ struct ShuttleApp {
     query: String,
     state: Arc<Mutex<ShuttleState>>,
     matcher: Box<dyn Matcher>,
+    providers: Vec<Arc<dyn Provider>>,
 }
 
 impl ShuttleApp {
-    pub fn new(matcher: Box<dyn Matcher>) -> Self {
+    pub fn new(providers: Vec<Arc<dyn Provider>>, matcher: Box<dyn Matcher>) -> Self {
         Self {
             query: String::new(),
             state: Arc::new(ShuttleState::Loading.into()),
+            providers,
             matcher,
         }
     }
@@ -218,17 +189,23 @@ impl ShuttleApp {
 
                 ui.separator();
 
+                let rows = (ui.available_height() / 28.0).floor() as usize;
+
                 if let ShuttleState::Loaded(state) = state {
+                    let items_count = state.filtered.iter()
+                        .flatten()
+                        .count();
+
                     let items_iter = state.filtered.iter()
                         .flatten()
                         .enumerate()
-                        .skip(state.selected.saturating_sub(8));
+                        .skip(state.selected.saturating_sub(rows/2).min(items_count.saturating_sub(rows)));
 
                     for (idx, item) in items_iter {
                         let selected = state.selected == idx;
                         let color: Color32 = if selected { Color32::WHITE } else { Color32::GRAY };
 
-                        let response = ui.horizontal(|ui| {
+                        ui.horizontal(|ui| {
                             ui.set_height(24.0);
 
                             let label = Label::new(RichText::new(&item.label).color(color)).ui(ui);
@@ -236,9 +213,9 @@ impl ShuttleApp {
                             label.rect
                         });
 
-                        if !ui.clip_rect().intersects(response.inner) {
-                            break;
-                        }
+                        // if !ui.clip_rect().intersects(response.inner) {
+                        //     break;
+                        // }
                     }
                 }
 
@@ -267,8 +244,10 @@ fn create_app(cc: &CreationContext<'_>, app: ShuttleApp) -> Box<dyn App> {
     let ctx = cc.egui_ctx.clone();
     let state_arc = Arc::clone(&app.state);
 
+    let providers = app.providers.clone();
+
     spawn(move || {
-        let items = load_items().unwrap();
+        let items = load_items(&providers).unwrap();
 
         let mut state = state_arc.lock().unwrap();
 
@@ -288,22 +267,7 @@ fn create_app(cc: &CreationContext<'_>, app: ShuttleApp) -> Box<dyn App> {
     Box::new(app)
 }
 
-fn load_items_from_providers() -> Result<Vec<Item>> {
-    let gh = "https://srv-git-01-hh1.alinghi.tipp24.net/api/v3";
-
-    let providers: Vec<Box<dyn Provider>> = vec![
-        Box::new(Github::new_with_endpoint("b2b", gh)),
-        Box::new(Github::new_with_endpoint("eSailors", gh)),
-        Box::new(Github::new_with_endpoint("iwg", gh)),
-        Box::new(Github::new_with_endpoint("tipp24", gh)),
-        Box::new(Github::new_with_endpoint("website", gh)),
-        Box::new(Github::new_with_endpoint("zig", gh)),
-        Box::new(Jenkins::new("http://jenkins.iwg.ham.sg-cloud.co.uk")),
-        Box::new(Jenkins::new("http://platform-live.code.ham.sg-cloud.co.uk")),
-        Box::new(Jenkins::new("http://platform.code.ham.sg-cloud.co.uk")),
-        Box::new(Jenkins::new("http://zig-jenkins.iwg.ham.sg-cloud.co.uk")),
-    ];
-
+fn load_items_from_providers(providers: &[Arc<dyn Provider>]) -> Result<Vec<Item>> {
     use rayon::prelude::*;
 
     let items: Vec<_> = providers.par_iter()
@@ -323,11 +287,11 @@ fn load_items_from_cache(r: impl Read) -> Result<Vec<Item>> {
     Ok(cache.items)
 }
 
-fn load_items() -> Result<Vec<Item>> {
+fn load_items(providers: &[Arc<dyn Provider>]) -> Result<Vec<Item>> {
     match File::open("/tmp/shuttle.cache") {
         Ok(fp) => load_items_from_cache(fp),
         Err(_) => {
-            let mut items = load_items_from_providers()?;
+            let mut items = load_items_from_providers(providers)?;
 
             // by default we sort all items by display label
             items.sort_by(|lhs, rhs| lhs.label.cmp(&rhs.label));
@@ -343,6 +307,8 @@ fn load_items() -> Result<Vec<Item>> {
 }
 
 fn main() -> Result<()> {
+    env_logger::init();
+
     let native_options = eframe::NativeOptions {
         always_on_top: true,
         resizable: false,
@@ -351,9 +317,24 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
+    let gh = "https://srv-git-01-hh1.alinghi.tipp24.net/api/v3";
+
+    let providers: Vec<Arc<dyn Provider>> = vec![
+        Arc::new(Github::new_with_endpoint("b2b", gh)),
+        Arc::new(Github::new_with_endpoint("eSailors", gh)),
+        Arc::new(Github::new_with_endpoint("iwg", gh)),
+        Arc::new(Github::new_with_endpoint("tipp24", gh)),
+        Arc::new(Github::new_with_endpoint("website", gh)),
+        Arc::new(Github::new_with_endpoint("zig", gh)),
+        Arc::new(Jenkins::new("http://jenkins.iwg.ham.sg-cloud.co.uk")),
+        Arc::new(Jenkins::new("http://platform-live.code.ham.sg-cloud.co.uk")),
+        Arc::new(Jenkins::new("http://platform.code.ham.sg-cloud.co.uk")),
+        Arc::new(Jenkins::new("http://zig-jenkins.iwg.ham.sg-cloud.co.uk")),
+    ];
+
     // let matcher = Box::new(fuzzy_matcher::skim::SkimMatcherV2::default().ignore_case());
-    let matcher = Box::new(SimpleMatcher);
-    let app = ShuttleApp::new(matcher);
+    let matcher = Box::new(shuttle::SimpleMatcher);
+    let app = ShuttleApp::new(providers, matcher);
     let app_name = "shuttle";
     let app_creator: AppCreator = Box::new(|ctx| create_app(ctx, app));
     eframe::run_native(app_name, native_options, app_creator)
