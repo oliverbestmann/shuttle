@@ -328,7 +328,7 @@ fn main() -> Result<()> {
         Arc::new(Github::new_with_endpoint("zig", gh)),
         Arc::new(Jenkins::new("http://jenkins.iwg.ham.sg-cloud.co.uk")),
         Arc::new(Jenkins::new("http://platform-live.code.ham.sg-cloud.co.uk")),
-        Arc::new(Jenkins::new("http://platform.code.ham.sg-cloud.co.uk")),
+        Arc::new(Jenkins::new("https://platform-jenkins.test.h.zeal.zone")),
         Arc::new(Jenkins::new("http://zig-jenkins.iwg.ham.sg-cloud.co.uk")),
     ];
 
