@@ -95,10 +95,10 @@ impl ShuttleApp {
         let mut launch = false;
 
 
-        for event in &ctx.input().events {
+        for event in ctx.input(|i| i.events.clone()) {
             match event {
                 Event::Text(t) => {
-                    self.query += t;
+                    self.query += &t;
                     require_update = true;
                 }
 
@@ -109,7 +109,7 @@ impl ShuttleApp {
                     }
                 }
 
-                Event::Key { key: Key::W, pressed: true, modifiers } if modifiers.ctrl => {
+                Event::Key { key: Key::W, pressed: true, modifiers, .. } if modifiers.ctrl => {
                     if let Some(pos) = self.query.trim_end().rfind(' ') {
                         self.query.truncate(pos + 1);
                         require_reset = true;
@@ -120,7 +120,7 @@ impl ShuttleApp {
                 }
 
                 Event::Key { key: Key::Escape, pressed: true, .. } => {
-                    frame.quit();
+                    frame.close();
                 }
 
                 Event::Key { key: Key::Enter, pressed: true, .. } => {
@@ -162,7 +162,7 @@ impl ShuttleApp {
                         if let Some(selected) = filtered.get(state.selected) {
                             //println!("launching {:?}", selected.value);
                             self.launch(&selected.value);
-                            return frame.quit();
+                            return frame.close();
                         }
                     }
                 }
@@ -327,7 +327,7 @@ fn main() -> Result<()> {
         Arc::new(Github::new_with_endpoint("website", gh)),
         Arc::new(Github::new_with_endpoint("zig", gh)),
         Arc::new(Jenkins::new("http://jenkins.iwg.ham.sg-cloud.co.uk")),
-        Arc::new(Jenkins::new("http://platform-live.code.ham.sg-cloud.co.uk")),
+        Arc::new(Jenkins::new("https://platform-jenkins.live.h.zeal.zone")),
         Arc::new(Jenkins::new("https://platform-jenkins.test.h.zeal.zone")),
         Arc::new(Jenkins::new("http://zig-jenkins.iwg.ham.sg-cloud.co.uk")),
     ];
