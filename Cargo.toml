@@ -6,14 +6,14 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.69"
-eframe = "0.21.3"
-egui = "0.21.0"
-env_logger = "0.10.0"
+anyhow = "1.0.80"
+eframe = "0.26.2"
+egui = "0.26.2"
+env_logger = "0.11.2"
 fuzzy-matcher = "0.3.7"
-itertools = "0.10.5"
-rayon = "1.6.1"
-serde = { version = "1.0.152", features = ["derive"] }
-serde_json = "1.0.93"
-thiserror = "1.0.38"
-ureq = { version = "2.6.2", features = ["json"] }
+itertools = "0.12.1"
+rayon = "1.8.1"
+serde = { version = "1.0.197", features = ["derive"] }
+serde_json = "1.0.114"
+thiserror = "1.0.57"
+ureq = { version = "2.9.6", features = ["json"] }

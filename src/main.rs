@@ -5,14 +5,15 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::thread::spawn;
 
-use anyhow::Result;
-use eframe::{App, AppCreator, CreationContext, egui, Storage};
+use anyhow::{anyhow, Result};
+use eframe::{App, AppCreator, CreationContext, egui};
 use eframe::egui::{Color32, Event, Key, Label, Widget};
+use egui::{ViewportBuilder, ViewportCommand};
 use itertools::Itertools;
 use serde::Deserialize;
 use serde::Serialize;
 
-use crate::egui::{Context, Frame, RichText, Spinner, Visuals};
+use crate::egui::{Context, RichText, Spinner, Visuals};
 use crate::shuttle::{Github, Item, Jenkins, Matcher, Provider};
 
 mod shuttle;
@@ -85,7 +86,7 @@ impl ShuttleApp {
             .exec();
     }
 
-    fn handle_events(&mut self, ctx: &&Context, frame: &mut eframe::Frame) {
+    fn handle_events(&mut self, ctx: &&Context, _frame: &mut eframe::Frame) {
         let state = &mut *self.state.lock().unwrap();
 
         let mut require_update = false;
@@ -120,7 +121,7 @@ impl ShuttleApp {
                 }
 
                 Event::Key { key: Key::Escape, pressed: true, .. } => {
-                    frame.close();
+                    return ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
 
                 Event::Key { key: Key::Enter, pressed: true, .. } => {
@@ -162,7 +163,7 @@ impl ShuttleApp {
                         if let Some(selected) = filtered.get(state.selected) {
                             //println!("launching {:?}", selected.value);
                             self.launch(&selected.value);
-                            return frame.close();
+                            return ctx.send_viewport_cmd(ViewportCommand::Close);
                         }
                     }
                 }
@@ -310,10 +311,15 @@ fn main() -> Result<()> {
     env_logger::init();
 
     let native_options = eframe::NativeOptions {
-        always_on_top: true,
-        resizable: false,
-        transparent: false,
-        decorated: false,
+        viewport: ViewportBuilder::default()
+            .with_always_on_top()
+            .with_resizable(false)
+            .with_transparent(false)
+            .with_active(true)
+            .with_decorations(false),
+
+        centered: true,
+        
         ..Default::default()
     };
 
@@ -337,7 +343,7 @@ fn main() -> Result<()> {
     let app = ShuttleApp::new(providers, matcher);
     let app_name = "shuttle";
     let app_creator: AppCreator = Box::new(|ctx| create_app(ctx, app));
-    eframe::run_native(app_name, native_options, app_creator);
+    eframe::run_native(app_name, native_options, app_creator).map_err(|err| anyhow!("failed to start: {:?}", err))?;
     Ok(())
 }
 
